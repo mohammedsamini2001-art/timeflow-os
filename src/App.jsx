@@ -32,6 +32,7 @@ const DEFAULT_SETTINGS = {
   defaultShortBreak: 5,
   defaultLongBreak: 15,
   notificationsEnabled: false,
+  soundEnabled: true,
 };
 
 function uid() {
@@ -289,6 +290,13 @@ export default function App() {
     return () => clearInterval(t);
   }, []);
 
+  useEffect(() => {
+    const unlock = () => { unlockAudio(); window.removeEventListener("pointerdown", unlock); window.removeEventListener("keydown", unlock); };
+    window.addEventListener("pointerdown", unlock, { once: true });
+    window.addEventListener("keydown", unlock, { once: true });
+    return () => { window.removeEventListener("pointerdown", unlock); window.removeEventListener("keydown", unlock); };
+  }, []);
+
   /* ---------------- Alarm checking (in-app, foreground only) ---------- */
   const firedRef = useRef(new Set());
   useEffect(() => {
@@ -307,6 +315,7 @@ export default function App() {
         if (firedRef.current.has(key)) return;
         firedRef.current.add(key);
         push(`Alarm: ${a.label || "Untitled alarm"}`, "alarm");
+        if (settings.soundEnabled !== false) playAlertChime();
         if (settings.notificationsEnabled && typeof Notification !== "undefined" && Notification.permission === "granted") {
           try { new Notification(a.label || "TimeFlow alarm", { body: formatTime(a.time, settings.clock24h) }); } catch {}
         }
@@ -1102,12 +1111,61 @@ function TaskModal({ task, goals, habits, onSave, onClose }) {
    ======================================================================== */
 
 function useTicker(active, onTick, intervalMs = 1000) {
+  const savedCallback = useRef(onTick);
+  useEffect(() => { savedCallback.current = onTick; }, [onTick]);
   useEffect(() => {
     if (!active) return;
-    const t = setInterval(onTick, intervalMs);
+    const t = setInterval(() => savedCallback.current(), intervalMs);
     return () => clearInterval(t);
-  }, [active, onTick, intervalMs]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, intervalMs]);
 }
+
+/* ---------------------------------------------------------------------- */
+/*  Sound engine (Web Audio API — no external audio files, works offline) */
+/* ---------------------------------------------------------------------- */
+
+let sharedAudioCtx = null;
+function getAudioCtx() {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return null;
+  if (!sharedAudioCtx) sharedAudioCtx = new Ctx();
+  if (sharedAudioCtx.state === "suspended") sharedAudioCtx.resume();
+  return sharedAudioCtx;
+}
+
+/* Mobile/desktop browsers block audio until a real user gesture has
+   happened at least once. Call this from any click/tap early on so
+   later programmatic sounds (alarms firing on a timer) are allowed to play. */
+function unlockAudio() {
+  const ctx = getAudioCtx();
+  if (ctx && ctx.state === "suspended") ctx.resume();
+}
+
+function playTone(freq = 880, startAt = 0, duration = 0.16, gainPeak = 0.22) {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  const t0 = ctx.currentTime + startAt;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = "sine";
+  osc.frequency.setValueAtTime(freq, t0);
+  gain.gain.setValueAtTime(0, t0);
+  gain.gain.linearRampToValueAtTime(gainPeak, t0 + 0.01);
+  gain.gain.exponentialRampToValueAtTime(0.001, t0 + duration);
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  osc.start(t0);
+  osc.stop(t0 + duration + 0.02);
+}
+
+/* A short, distinct three-beep pattern for alarms/timers going off. */
+function playAlertChime() {
+  playTone(880, 0, 0.16);
+  playTone(880, 0.22, 0.16);
+  playTone(1175, 0.44, 0.24);
+}
+
 
 function FocusView({ ctx }) {
   const { settings, tasks, focusSessions, setFocusSessions, push } = ctx;
@@ -1134,10 +1192,12 @@ function FocusView({ ctx }) {
           setPomoPhase(nextPhase);
           setPomoSecondsLeft(phaseMinutes[nextPhase] * 60);
           push(`Focus session complete. Time for a ${nextPhase === "long" ? "long" : "short"} break.`);
+          if (settings.soundEnabled !== false) playAlertChime();
         } else {
           setPomoPhase("focus");
           setPomoSecondsLeft(phaseMinutes.focus * 60);
           push("Break's over. Ready for another focus session.");
+          if (settings.soundEnabled !== false) playAlertChime();
         }
         return 0;
       }
@@ -1162,7 +1222,7 @@ function FocusView({ ctx }) {
   const [cdSecondsLeft, setCdSecondsLeft] = useState(10 * 60);
   const [cdRunning, setCdRunning] = useState(false);
   useTicker(cdRunning, () => setCdSecondsLeft((s) => {
-    if (s <= 1) { setCdRunning(false); push("Countdown complete."); logSession(cdInputMinutes, "countdown"); return 0; }
+    if (s <= 1) { setCdRunning(false); push("Countdown complete."); if (settings.soundEnabled !== false) playAlertChime(); logSession(cdInputMinutes, "countdown"); return 0; }
     return s - 1;
   }));
 
@@ -1430,11 +1490,12 @@ function AlarmsView({ ctx, requestPermission }) {
         <div className="mb-4 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-sm text-amber-200 flex items-start gap-2">
           <Bell size={15} className="mt-0.5 shrink-0" />
           <div className="flex-1">
-            Alarms only trigger while this app is open in your browser — background notifications need permission and an open tab or installed app.
+            Alarms only trigger while this app is open (a tab, or the installed app) — they play a sound here and can also show a system notification.
             <button onClick={requestPermission} className="block mt-1 underline">Enable browser notifications</button>
           </div>
         </div>
       )}
+      <button onClick={() => { unlockAudio(); playAlertChime(); }} className="text-xs text-teal-400 hover:underline mb-4 inline-block">Test alarm sound</button>
 
       {alarms.length === 0 ? <EmptyState icon={AlarmClock} title="No alarms set" /> : (
         <div className="space-y-2">
@@ -1639,6 +1700,13 @@ function SettingsView({ ctx }) {
               <option value={0}>Sunday</option><option value={1}>Monday</option>
             </select>
           </Field>
+          <label className="flex items-center justify-between text-sm text-slate-300 mb-1">
+            <span>Alarm &amp; timer sound</span>
+            <input type="checkbox" checked={settings.soundEnabled !== false} onChange={(e) => setSettings({ ...settings, soundEnabled: e.target.checked })} />
+          </label>
+          {settings.soundEnabled !== false && (
+            <button onClick={() => { unlockAudio(); playAlertChime(); }} className="text-xs text-teal-400 hover:underline mt-1">Test sound</button>
+          )}
         </div>
 
         <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
